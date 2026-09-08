@@ -229,26 +229,24 @@ def downsample(path, maxn):
 
 
 def replay_swipe(device, path, duration_ms):
-    """按记录的整条轨迹和速度回放滑动。优先 input motionevent(Android 12+)，
-    不支持时返回 False，由调用方回退为首尾单段滑动。"""
-    pts = downsample(path, 60)
-    if len(pts) < 2:
+    """按记录的整条轨迹和速度回放滑动。
+    用若干段 input swipe 在【一次 adb shell 会话】里拼接：input swipe 自带时长、
+    单次进程即可完成一段直线，设备开销小(~30ms/段)且无需 Android12 的 motionevent，
+    从而总时长≈录制时长(还原真实滑动速度)。"""
+    dur = max(300, int(duration_ms))
+    n_seg = min(14, max(3, dur // 90))   # 段数按时长自适应：短滑少段、长滑多段
+    pts = downsample(path, n_seg + 1)
+    n = len(pts)
+    if n < 2:
         return False
-    x0, y0 = pts[0]
-    xl, yl = pts[-1]
+    seg = max(20, int(dur / (n - 1)))   # 每段时长，总和≈录制时长
+    parts = [f"input swipe {pts[i-1][0]} {pts[i-1][1]} {pts[i][0]} {pts[i][1]} {seg}"
+             for i in range(1, n)]
     try:
-        adb(device, "shell", "input", "motionevent", "DOWN", str(x0), str(y0), check=True)
+        adb(device, "shell", " ; ".join(parts), check=True)
+        return True
     except AdbError:
         return False
-    if len(pts) >= 3:
-        seg = max(0.03, duration_ms / 1000.0 / (len(pts) - 1))
-        for (px, py) in pts[1:-1]:
-            time.sleep(seg)
-            adb(device, "shell", "input", "motionevent", "MOVE", str(px), str(py), check=True)
-    seg = max(0.03, duration_ms / 1000.0 / max(len(pts) - 1, 1))
-    time.sleep(seg)
-    adb(device, "shell", "input", "motionevent", "UP", str(xl), str(yl), check=True)
-    return True
 
 
 def resolve_tap_xy(device, step):
@@ -532,20 +530,21 @@ key()        { adb_cmd shell input keyevent "$1"; sleep_step; }
 back()       { adb_cmd shell input keyevent 4; sleep_step; }
 home()       { adb_cmd shell input keyevent 3; sleep_step; }
 swipe()      { adb_cmd shell input swipe "$1" "$2" "$3" "$4" "${5:-300}"; sleep_step; }
-swipe_traj() {  # $1="x,y x,y ..." 轨迹点; $2=总时长ms; Android12+ moaction, 否则回退首尾单段
-  local pts dur n fst last x y i
-  dur="${2:-400}"; pts="$1"; fst="${pts%% *}"; last="${pts##* }"
-  if ! adb_cmd shell input motionevent DOWN "${fst%%,*}" "${fst#*,}" 2>/dev/null; then
-    adb_cmd shell input swipe "${fst%%,*}" "${fst#*,}" "${last%%,*}" "${last#*,}" "$dur"
-    sleep_step; return
-  fi
-  n=0; for _ in ${pts}; do n=$((n+1)); done
-  i=0
+swipe_traj() {  # $1="x,y x,y ..." 轨迹点; $2=总时长ms; 多段 input swipe 在单会话拼接(快, 全Android可用)
+  local pts dur n seg prev p parts
+  dur="${2:-400}"; pts="$1"
+  n=0; for _p in ${pts}; do n=$((n+1)); done
+  [ "$n" -lt 2 ] && return
+  seg=$(( (dur > 49 ? dur : 300) / (n - 1) )); [ "$seg" -lt 20 ] && seg=20
+  parts=""; prev=""
   for p in ${pts}; do
-    i=$((i+1)); x="${p%%,*}"; y="${p#*,}"
-    if [ "$i" = "$n" ]; then adb_cmd shell input motionevent UP "$x" "$y"; break; fi
-    if [ "$i" -gt 1 ]; then sleep "$(awk "BEGIN{print ${dur}/1000/${n}}")"; adb_cmd shell input motionevent MOVE "$x" "$y" 2>/dev/null; fi
+    if [ -n "$prev" ]; then
+      parts="$parts; input swipe ${prev%%,*} ${prev#*,} ${p%%,*} ${p#*,} $seg"
+    fi
+    prev="$p"
   done
+  parts="${parts#; }"
+  adb_cmd shell "$parts"
   sleep_step
 }
 wait_ms()    { sleep "$(awk "BEGIN{print $1/1000}")"; }
@@ -696,7 +695,8 @@ def export_shell(script):
             path = step.get("path")
             dur = int(step.get("duration", 300))
             if isinstance(path, list) and len(path) >= 2:
-                traj = " ".join(f"{int(x)},{int(y)}" for x, y in path)
+                n_seg = min(14, max(3, dur // 90))
+                traj = " ".join(f"{int(x)},{int(y)}" for x, y in downsample(path, n_seg + 1))
                 lines.append(f"swipe_traj '{traj}' {dur}{comment}")
             else:
                 lines.append(f"swipe {int(step['x1'])} {int(step['y1'])} "
