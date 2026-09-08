@@ -252,21 +252,35 @@ def replay_swipe(device, path, duration_ms):
 
 
 def resolve_tap_xy(device, step):
-    """解析点击目标坐标：优先用 x/y，否则按控件 resource_id/text 定位。
+    """解析点击目标坐标：优先用 x/y，否则按控件定位。
+    支持：resource_id + index(第N个匹配)、加 text 过滤(id+文字)、文字精确/包含匹配。
     返回 (x, y)；找不到控件时返回 None。"""
     if step.get("x") is not None and step.get("y") is not None:
         return int(step["x"]), int(step["y"])
     rid = step.get("resource_id") or ""
     text = step.get("text") or ""
+    match = (str(step.get("text_match") or "exact")).lower()
+    idx = int(step.get("index") or 0)
+    if idx < 0:
+        idx = 0
+    k = 0
     for n in uidump(device):
-        if rid and n["resource_id"] == rid:
-            break
-        if not rid and text and n["text"] == text:
-            break
-    else:
-        return None
-    b = n["bounds"]
-    return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        if rid and n["resource_id"] != rid:
+            continue
+        if not rid and not text:
+            continue  # 无 id 又无文字，无法按控件定位（编辑器会回落为该控件中心坐标）
+        if text:
+            t = n["text"]
+            if match == "contains":
+                if text not in t:
+                    continue
+            elif t != text:
+                continue
+        if k == idx:
+            b = n["bounds"]
+            return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        k += 1
+    return None
 
 
 def resolve_tap_xy_retry(device, step, retries):
@@ -484,8 +498,13 @@ def run_script(device, script):
             logs.append(r)
             if not r["ok"]:
                 break
-            if i < len(script["steps"]) - 1 and step.get("action") != "wait":
-                time.sleep(delay)
+            if i < len(script["steps"]) - 1:
+                local = step.get("delay")   # 局部间隔(ms)，局部优先生效
+                if local is not None:
+                    if local > 0:
+                        time.sleep(local / 1000)
+                elif step.get("action") != "wait":
+                    time.sleep(delay)       # 全局间隔
     finally:
         _run_flags.pop(run_id, None)
         if needs_adbk:
@@ -554,21 +573,28 @@ clear_text() {  # 已装 ADBKeyboard → 广播整段清空; 否则 MOVE_END + �
   sleep_step
 }
 
-tap_id() {  # $1=resource-id; $2=按文字定位; $3=可选重试次数(默认 $TAP_RETRY, 每次1秒)
-  local xml b i x1 y1 x2 y2 cx cy retries
-  retries="${3:-$TAP_RETRY}"; retries=$(( retries > 0 ? retries : 1 )); i=0
+tap_id() {  # $1=resource-id; $2=文字过滤(可空); $3=第几个匹配(0基,默认0); $4=重试次数; $5=match(exact|contains)
+  local xml b i x1 y1 x2 y2 cx cy retries occurred m pat
+  retries="${4:-$TAP_RETRY}"; retries=$(( retries > 0 ? retries : 1 )); i=0
+  if [ -n "$1" ]; then
+    pat="resource-id=\"$1\""
+  elif [ "${5:-exact}" = "contains" ]; then
+    pat="text=\"[^\"]*$2[^\"]*\""
+  else
+    pat="text=\"$2\""
+  fi
   while :; do
     adb_cmd shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1
     xml=$(adb_cmd shell cat /sdcard/ui.xml | tr -d '\r')   # 去掉 adb shell 的 \r，防解析错位
-    if [ -n "$1" ]; then
-      b=$(printf '%s' "$xml" | grep -o "resource-id=\"$1\"[^>]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | grep -o '\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]' | head -1)
-    else
-      b=$(printf '%s' "$xml" | grep -o "text=\"$2\"[^>]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | grep -o '\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]' | head -1)
-    fi
+    b=""; occurred=0
+    for m in $(printf '%s' "$xml" | grep -o "${pat}[^>]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | grep -o '\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]'); do
+      [ "$occurred" = "${3:-0}" ] && { b="$m"; break; }
+      occurred=$((occurred+1))
+    done
     [ -n "$b" ] && break
     i=$(( i + 1 ))
     if [ "$i" -ge "$retries" ]; then
-      echo "[tap_id] 未找到控件(试了${retries}次): ${1:-$2}" >&2
+      echo "[tap_id] 未找到控件(试了${retries}次): ${1:-$2} #${3:-0}" >&2
       return 1
     fi
     sleep 1   # 等界面刷新后重试
@@ -631,19 +657,25 @@ def export_shell(script):
         "# ========== 步骤序列 ==========",
     ]
     def focus_call(step):
-        """返回聚焦目标的 shell 调用行（坐标 tap 或控件 tap_id）。控件型可带单步重试次数。"""
+        """返回聚焦目标的 shell 调用行（坐标 tap 或控件 tap_id）。
+        控件型：$1=rid, $2=文字过滤, $3=第N个匹配, $4=重试, $5=contains。"""
         if step.get("x") is not None and step.get("y") is not None:
             return f"tap {int(step['x'])} {int(step['y'])}"
-        retry = f" {int(step['retry'])}" if step.get("retry") is not None else ""
         rid = step.get("resource_id") or ""
-        if rid:
-            return f"tap_id {sh_quote(rid)}{retry}"
-        return f"tap_id '' {sh_quote(step.get('text', ''))}{retry}"
+        text = step.get("text") or ""
+        idx = int(step.get("index") or 0)
+        extra = f" {int(step['retry'])}" if step.get("retry") is not None else ""
+        if (step.get("text_match") or "exact") == "contains":
+            extra += " contains"
+        return f"tap_id {sh_quote(rid)} {sh_quote(text)} {idx}{extra}"
 
     for step in script.get("steps", []):
         a = step.get("action")
         note = step.get("note", "")
         comment = f"  # {note}" if note else ""
+        locald = step.get("delay")   # 每步可单独设置间隔(ms)，局部优先
+        if locald is not None:
+            lines.append(f"STEP_DELAY={max(0, locald)/1000:.3f}   # 本步骤局部间隔")
         if a in ("tap", "tap_id"):
             lines.append(focus_call(step) + comment)
         elif a == "tap_clear":
@@ -681,6 +713,8 @@ def export_shell(script):
             lines.append(f"back{comment}")
         elif a == "home":
             lines.append(f"home{comment}")
+        if locald is not None:
+            lines.append(f"STEP_DELAY={delay:.3f}   # 还原全局间隔")
     lines.append("")
     lines.append('echo "脚本执行完成"')
     return "\n".join(lines)
@@ -693,6 +727,36 @@ def safe_filename(name):
 # ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
+
+def nav_bar_height(device, display_h):
+    """读取系统导航栏高度：截图常包含这段非内容区(虚拟键)，裁剪后可让截图=App内容区。"""
+    try:
+        out = adb(device, "shell", "dumpsys", "window")
+        m = re.search(r"ITYPE_NAVIGATION_BAR frame=\[0,(\d+)\]\[(\d+),(\d+)\]", out)
+        if m and display_h:
+            return max(0, display_h - int(m.group(1)))
+    except Exception:
+        pass
+    return 0
+
+
+def crop_nav_bottom(png, nav_h):
+    """裁掉截图底部导航栏高度的非内容区，使截图高度=App可交互内容区高度。"""
+    if not nav_h or nav_h <= 0:
+        return png
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(png))
+        w, h = im.size
+        if nav_h >= h:
+            return png
+        buf = io.BytesIO()
+        im.crop((0, 0, w, h - nav_h)).save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:
+        return png
+
 
 @app.get("/")
 def index():
@@ -713,6 +777,15 @@ def api_devices():
 def api_screenshot():
     device = request.args.get("device") or resolve_device()
     png = take_screenshot(device)
+    # 裁掉底部导航栏(虚拟键)高度，让截图=App内容区，坐标/蒙层才和真实可点击区对齐
+    try:
+        import struct as _st
+        _, h = _st.unpack(">II", png[:24][16:24])
+        nav_h = nav_bar_height(device, h)
+        if nav_h:
+            png = crop_nav_bottom(png, nav_h)
+    except Exception:
+        pass
     return Response(png, mimetype="image/png")
 
 
@@ -720,6 +793,36 @@ def api_screenshot():
 def api_uidump():
     device = request.args.get("device") or resolve_device()
     return jsonify(uidump(device))
+
+
+@app.get("/api/display_info")
+def api_display_info():
+    """返回当前显示几何：宽高(横竖屏双击实际)、导航栏/状态栏高度与可见性。
+    用于坐标模式下修正虚拟按键(导航栏)隐藏造成的内容区高度变化/底部坐标偏移。"""
+    device = request.args.get("device") or resolve_device()
+    w = h = nav_h = status_h = 0
+    nav_vis = None
+    try:
+        png = take_screenshot(device)
+        import struct as _st
+        w, h = _st.unpack(">II", png[:24][16:24])
+    except Exception:
+        pass
+    try:
+        out = adb(device, "shell", "dumpsys", "window")
+        nf = re.search(r"ITYPE_NAVIGATION_BAR frame=\[0,(\d+)\]\[(\d+),(\d+)\]", out)
+        if nf and h:
+            nav_h = h - int(nf.group(1))
+        nv = re.search(r"ITYPE_NAVIGATION_BAR frame=\[0,\d+\]\[(\d+),(\d+)\] visible=(\S+)", out)
+        if nv:
+            nav_vis = nv.group(3) == "true"
+        sf = re.search(r"ITYPE_STATUS_BAR frame=\[0,0\]\[(\d+),(\d+)\]", out)
+        if sf:
+            status_h = int(sf.group(2))
+    except Exception:
+        pass
+    return jsonify({"width": w, "height": h, "nav_height": nav_h,
+                    "status_height": status_h, "nav_visible": nav_vis})
 
 
 @app.post("/api/run_step")

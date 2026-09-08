@@ -19,6 +19,7 @@
   <label class="toolbar-toggle" title="勾选后：编辑步骤点确定 → 自动在设备上执行该动作 → 刷新截图；取消则只保存不执行">
     <input id="autoRunEdit" type="checkbox" checked> 编辑后自动执行
   </label>
+  <button id="btnRecord" class="btn" title="全屏录制：在截图上的每次操作自动生成步骤并在设备上同步执行">● 录制</button>
   <button id="btnOpen" class="btn">📂 打开</button>
   <button id="btnSave" class="btn">💾 保存</button>
   <button id="btnExport" class="btn primary">📤 导出 .sh</button>
@@ -54,10 +55,24 @@
       <button class="tab active" data-mode="coord">📍 坐标模式</button>
       <button class="tab" data-mode="widget">🎯 控件模式</button>
       <div class="spacer"></div>
+      <label class="toolbar-toggle" title="开启后按间隔自动刷新截图，实时同步设备画面">
+        <input id="rtOn" type="checkbox"> 实时
+      </label>
+      <input id="rtInterval" type="number" value="1000" min="500" step="100" title="刷新间隔(ms)，最小 500" style="width:62px">
+      <span style="font-size:12px;color:var(--muted)">ms</span>
       <button id="btnShot" class="btn small">🔄 刷新截图</button>
       <button id="btnScrcpy" class="btn small" title="打开 scrcpy 实时镜像">🖥 scrcpy</button>
     </div>
 
+    <div id="recBar" class="rec-bar hidden">
+      <span class="rec-dot">●</span>
+      <span style="font-size:13px;flex-shrink:0">录制中</span>
+      <input id="recText" type="text" placeholder="在设备输入框输入文本，回车记录" style="flex:1;min-width:120px">
+      <span id="recCount" class="rec-count">0</span>
+      <button id="recBack" class="btn small" title="记录并执行：返回">◀ 返回</button>
+      <button id="recHome" class="btn small" title="记录并执行：Home">🏠</button>
+      <button id="recStop" class="btn small danger">结束</button>
+    </div>
     <div id="shotWrap">
       <img id="screenshot" alt="设备截图（点击刷新）" draggable="false">
       <div id="overlay"></div>
@@ -70,6 +85,9 @@
     </div>
     <div id="coordBar" class="hint">
       <span id="coordHint">点截图 / 控件 → 弹出步骤编辑窗口，选动作、填名称与内容</span>
+      <span class="coord-calb" title="已自动裁剪底部导航栏(内容区外)区域，坐标已对齐。此值一般保持0；仅遇特殊机型底部仍偏时才手动微调(正数=Y下移)">
+        底校Y <input id="coordY" type="number" value="0" style="width:54px">
+      </span>
     </div>
   </section>
 </main>
@@ -103,6 +121,9 @@
       <label>名称 / 备注
         <input id="sm_note" type="text" placeholder="例如：输入账号、点击登录">
       </label>
+      <label>执行后间隔(ms)（留空=用全局步骤间隔）
+        <input id="sm_delay" type="number" placeholder="留空用全局" style="max-width:180px">
+      </label>
 
       <div id="sm_target" class="form-box">
         <div class="form-title">点击位置 (三选一)</div>
@@ -112,7 +133,11 @@
         </div>
         <label>或 resource-id <input id="sm_rid" type="text" placeholder="com.xx:id/field"></label>
         <label>或 按文字 <input id="sm_ftext" type="text" placeholder="控件的显示文字"></label>
-        <label class="inrow">没找到重试几次(每次1秒) <input id="sm_retry" type="number" placeholder="留空用全局" style="max-width:120px"></label>
+        <div class="form-row">
+          <label class="inrow">相同id第几个 <input id="sm_index" type="number" value="0" style="max-width:80px" title="多个控件同id时取第几个(0=第一个)"></label>
+          <label class="inrow"><input id="sm_contains" type="checkbox"> 文字包含匹配</label>
+          <label class="inrow">没找到重试 <input id="sm_retry" type="number" placeholder="全局" style="max-width:80px" title="留空用全局"></label>
+        </div>
       </div>
 
       <label id="sm_inputRow">要输入的内容

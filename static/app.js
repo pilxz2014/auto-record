@@ -12,7 +12,14 @@ const state = {
   shotImg: null,        // HTMLImageElement, 用于精确缩放计算
   selectedIdx: -1,      // 步骤列表中当前选中项（用于"在此插入"）
   editorAutoRun: true,  // 编辑确认后自动执行该动作并刷新截图
+  coordYOffset: 0,      // 底部Y校正(px)：虚拟键隐藏时内容区高度差，正数=点击Y下移
+  rtOn: false,          // 实时刷新开关
+  rtInterval: 1000,     // 实时刷新间隔(ms)
+  rtBusy: false,        // 上一次刷新是否未完成(防重叠)
+  rtTimer: null,        // 实时刷新定时器
+  recording: false,     // 全屏录制模式
   running: false,
+  stopRequested: false, // 整跑时请求停止
   abortCtl: null,
 };
 
@@ -70,18 +77,25 @@ function targetLabel(step) {
 }
 
 function stepSummary(step) {
+  let s;
   switch (step.action) {
-    case "tap": return targetLabel(step);
-    case "tap_id": return targetLabel(step);
-    case "tap_clear": return targetLabel(step) + " → 清空";
-    case "tap_input": return targetLabel(step) + ` → 输入"${step.text}"`;
-    case "input": return `"${step.text}"`;
-    case "key": return step.key;
-    case "swipe": return `(${step.x1},${step.y1})→(${step.x2},${step.y2})`;
-    case "wait": return `${step.ms}ms`;
-    case "start_app": return step.package + (step.activity ? "/" + step.activity : "");
-    default: return "";
+    case "tap": s = targetLabel(step); break;
+    case "tap_id":
+      s = targetLabel(step);
+      if (step.index) s += ` #${step.index}`;
+      if ((step.text_match || "") === "contains") s += " (包含)";
+      break;
+    case "tap_clear": s = targetLabel(step) + " → 清空"; break;
+    case "tap_input": s = targetLabel(step) + ` → 输入"${step.text}"`; break;
+    case "input": s = `"${step.text}"`; break;
+    case "key": s = step.key; break;
+    case "swipe": s = `(${step.x1},${step.y1})→(${step.x2},${step.y2})`; break;
+    case "wait": s = `${step.ms}ms`; break;
+    case "start_app": s = step.package + (step.activity ? "/" + step.activity : ""); break;
+    default: s = "";
   }
+  if (step.delay != null && step.delay > 0) s += ` ·⏱${step.delay}ms`;
+  return s;
 }
 
 // ---------- 步骤列表渲染 ----------
@@ -243,12 +257,41 @@ function refreshScreenshot(alsoWidgets) {
   const qs = `?t=${Date.now()}&device=${encodeURIComponent(currentDevice())}`;
   img.src = "/api/screenshot" + qs;
   img.onload = () => {
+    state.rtBusy = false;   // 实时刷新可继续下一帧
     state.shotNatural = { w: img.naturalWidth, h: img.naturalHeight };
     updateScale();
     if (alsoWidgets || state.mode === "widget") loadWidgets();
   };
-  img.onerror = () => log("截图失败，请确认设备已连接", "err");
+  img.onerror = () => { state.rtBusy = false; log("截图失败，请确认设备已连接", "err"); };
 }
+
+// ---------- 实时刷新 ----------
+const RT_MIN_MS = 500;   // 最小间隔保护，避免刷爆设备
+
+function rtTick() {
+  // 上帧未完成 / 正在运行脚本 / 已关 都跳过
+  if (state.rtBusy || state.running || !state.rtOn) return;
+  state.rtBusy = true;
+  refreshScreenshot(state.mode === "widget");
+}
+function syncRt() {
+  if (state.rtTimer) { clearInterval(state.rtTimer); state.rtTimer = null; }
+  if (state.rtOn) state.rtTimer = setInterval(rtTick, state.rtInterval);
+}
+$("rtOn").addEventListener("change", (e) => {
+  state.rtOn = e.target.checked;
+  try { localStorage.setItem("rtOn", state.rtOn ? "1" : "0"); } catch (_) {}
+  syncRt();
+  if (state.rtOn) { refreshScreenshot(state.mode === "widget"); log(`实时刷新已开启(每 ${state.rtInterval}ms)`, "info"); }
+});
+$("rtInterval").addEventListener("change", (e) => {
+  let v = Number(e.target.value) || 1000;
+  v = Math.max(RT_MIN_MS, v);           // 保护：不小于最小间隔
+  e.target.value = v;
+  state.rtInterval = v;
+  try { localStorage.setItem("rtInterval", String(v)); } catch (_) {}
+  syncRt();
+});
 
 function updateScale() {
   const img = $("screenshot");
@@ -268,6 +311,11 @@ function devPoint(clientX, clientY) {
   const r = SHOT.getBoundingClientRect();
   return [Math.round((clientX - r.left) / state.shotScale),
           Math.round((clientY - r.top) / state.shotScale)];
+}
+// 坐标模式下“点击”使用的目标点：Y 额外应用底部校正(虚拟键隐藏时的内容区高度差)
+function tapPoint(clientX, clientY) {
+  const [x, y] = devPoint(clientX, clientY);
+  return [x, y + (state.coordYOffset || 0)];
 }
 function drawGestureDot(devX, devY) {
   const imgRect = SHOT.getBoundingClientRect();
@@ -307,18 +355,78 @@ SHOT.addEventListener("pointerup", (e) => {
   if (g.wasDrag && g.points.length >= 2) {
     const dur = Math.round(performance.now() - g.t0);
     const p0 = g.points[0], pl = g.points[g.points.length - 1];
-    state.script.steps.push({
+    const step = {
       action: "swipe", x1: p0[0], y1: p0[1], x2: pl[0], y2: pl[1],
       path: g.points.slice(), duration: Math.max(100, dur), note: "滑动手势录制",
-    });
-    renderSteps();
-    $("stepList").scrollTop = 1e9;
-    log(`已添加滑动轨迹(${g.points.length} 点, ${Math.max(100, dur)}ms)`, "ok");
+    };
+    if (state.recording) recordStep(step);
+    else { state.script.steps.push(step); renderSteps(); $("stepList").scrollTop = 1e9;
+      log(`已添加滑动轨迹(${g.points.length} 点, ${Math.max(100, dur)}ms)`, "ok"); }
   } else {
-    const [x, y] = devPoint(e.clientX, e.clientY);
-    openStepModal({ target: { x, y } });
+    const [x, y] = tapPoint(e.clientX, e.clientY);   // 点击用带底部校正的目标点
+    markTarget(x, y);                                  // 标记点击区域
+    if (state.recording) recordStep({ action: "tap", x, y, note: "录制" });
+    else openStepModal({ target: { x, y } });
   }
 });
+
+// 底部Y校正（默认0：截图已自动裁剪导航栏区域，坐标已对齐；仅特殊机型手动微调）
+$("coordY").addEventListener("input", (e) => {
+  state.coordYOffset = Number(e.target.value) || 0;
+  try { localStorage.setItem("coordYOffset", String(state.coordYOffset)); } catch (_) {}
+});
+
+// 在截图上临时标记点击/选中的目标区域
+function markTarget(x, y) {
+  const img = $("screenshot"), wrap = $("shotWrap");
+  const imgRect = img.getBoundingClientRect(), wrapRect = wrap.getBoundingClientRect();
+  const m = document.createElement("div");
+  m.className = "target-mark";
+  m.style.left = (imgRect.left - wrapRect.left + wrap.scrollLeft + x * state.shotScale) + "px";
+  m.style.top  = (imgRect.top  - wrapRect.top  + wrap.scrollTop  + y * state.shotScale) + "px";
+  $("overlay").appendChild(m);
+  setTimeout(() => m.remove(), 1600);
+}
+
+// ---------- 全屏录制 ----------
+function recordStep(step) {
+  state.script.steps.push(step);
+  renderSteps();
+  const idx = state.script.steps.length - 1;
+  const card = document.querySelector(`.step-card[data-idx="${idx}"]`);
+  if (card) { card.classList.add("rec"); setTimeout(() => card.classList.remove("rec"), 1600); }
+  $("stepList").scrollTop = 1e9;
+  $("recCount").textContent = state.script.steps.length;
+  const meta = STEP_META[step.action] || { label: step.action };
+  log(`● 录制 → 步骤${idx + 1}: ${meta.label}`, "ok");
+  runSingleStep(idx);   // 同步在设备上执行并刷新界面
+}
+
+function setRecording(on) {
+  state.recording = on;
+  $("recBar").classList.toggle("hidden", !on);
+  const b = $("btnRecord");
+  b.classList.toggle("recording", on);
+  b.textContent = on ? "◼ 停止录制" : "● 录制";
+  if (on) {
+    $("recCount").textContent = state.script.steps.length;
+    $("recText").value = "";
+    log("开始录制：在截图上的每次操作会自动生成步骤并在设备上同步执行", "info");
+  } else {
+    log(`录制结束，共 ${state.script.steps.length} 步（可保存/导出）`, "info");
+  }
+}
+$("btnRecord").addEventListener("click", () => setRecording(!state.recording));
+$("recStop").addEventListener("click", () => setRecording(false));
+$("recBack").addEventListener("click", () => recordStep({ action: "back", note: "录制" }));
+$("recHome").addEventListener("click", () => recordStep({ action: "home", note: "录制" }));
+function onRecText() {
+  const t = $("recText").value.trim();
+  if (!t) return;
+  recordStep({ action: "input", text: t, note: "录制" });
+  $("recText").value = "";
+}
+$("recText").addEventListener("keydown", (e) => { if (e.key === "Enter") onRecText(); });
 
 // 悬停显示坐标
 $("screenshot").addEventListener("mousemove", (e) => {
@@ -408,7 +516,28 @@ function renderWidgetList(filter = "") {
 $("widgetSearch").addEventListener("input", (e) => renderWidgetList(e.target.value));
 
 function pickWidget(w) {
-  openStepModal({ target: { resource_id: w.resource_id || "", text: w.resource_id ? "" : w.text } });
+  const center = [ (w.bounds[0] + w.bounds[2]) >> 1, (w.bounds[1] + w.bounds[3]) >> 1 ];
+  markTarget(center[0], center[1]);   // 标记所选控件点击区域
+  let target;
+  if (w.resource_id || w.text) {
+    // 有 id 或文字：记录“它是第几个同id/同文字的匹配”(默认0=第一个)；
+    // 并把解析坐标一并回传给编辑框作为参考(步骤仍按 id/文字定位)
+    const g = w.resource_id
+      ? x => x.resource_id === w.resource_id
+      : x => !x.resource_id && x.text === w.text;
+    const idx = Math.max(0, state.widgets.filter(g).indexOf(w));
+    target = { resource_id: w.resource_id || "", text: w.resource_id ? "" : w.text, index: idx, x: center[0], y: center[1] };
+  } else {
+    // 没有 id 也没有文字 → 回落为“该控件中心坐标”定位
+    target = { x: center[0], y: center[1] };
+  }
+  if (state.recording) {
+    if (target.x != null) recordStep({ action: "tap", x: target.x, y: target.y, note: "控件(无id)中心" });
+    else recordStep({ action: "tap_id", resource_id: target.resource_id, text: target.text,
+                      index: target.index, note: "录制" });
+  } else {
+    openStepModal({ target });
+  }
 }
 
 window.addEventListener("resize", () => { updateScale(); renderOverlay(); });
@@ -434,10 +563,13 @@ function openStepModal(opts = {}) {
     ? `编辑步骤 ${modalCtx.index + 1}` : "添加步骤";
   $("sm_action").value = step.action || "tap";
   $("sm_note").value = step.note || "";
+  $("sm_delay").value = step.delay ?? "";
   $("sm_x").value = (step.x != null ? step.x : tgt.x) ?? "";
   $("sm_y").value = (step.y != null ? step.y : tgt.y) ?? "";
   $("sm_rid").value = step.resource_id || tgt.resource_id || "";
   $("sm_ftext").value = step.text || tgt.text || "";
+  $("sm_index").value = (step.index ?? tgt.index) ?? 0;
+  $("sm_contains").checked = (step.text_match || "") === "contains";
   $("sm_retry").value = step.retry || "";
   const inText = step.action === "input" ? (step.text || "") : (step.input || "");
   $("sm_input").value = inText;
@@ -476,9 +608,13 @@ function readModalStep() {
   const x = $("sm_x").value, y = $("sm_y").value;
   const rid = $("sm_rid").value.trim(), ftext = $("sm_ftext").value.trim();
   if (TARGET_ACTIONS.includes(a)) {
-    if (x !== "" && y !== "") { st.x = Number(x); st.y = Number(y); st.resource_id = ""; st.text = ""; }
-    else if (rid) { st.x = null; st.y = null; st.resource_id = rid; st.text = ""; }
-    else { st.x = null; st.y = null; st.resource_id = ""; st.text = ftext; }
+    // 优先级：resource-id > 按文字 > 坐标(用户主动清掉定位时回落坐标)
+    if (rid) { st.x = null; st.y = null; st.resource_id = rid; st.text = ""; }
+    else if (ftext) { st.x = null; st.y = null; st.resource_id = ""; st.text = ftext; }
+    else if (x !== "" && y !== "") { st.x = Number(x); st.y = Number(y); st.resource_id = ""; st.text = ""; }
+    else { st.resource_id = ""; st.text = ""; }
+    st.index = Number($("sm_index").value) || 0;                 // 相同id取第N个
+    if ($("sm_contains").checked) st.text_match = "contains";    // 文字包含匹配
     const r2 = $("sm_retry").value;
     if (r2 !== "") st.retry = Number(r2);   // 单步重试覆盖
   }
@@ -491,6 +627,8 @@ function readModalStep() {
     if (modalCtx.mode === "edit" && state.script.steps[modalCtx.index].path) st.path = state.script.steps[modalCtx.index].path; }
   if (a === "wait") st.ms = Number($("sm_wms").value) || 500;
   if (a === "start_app") { st.package = $("sm_pkg").value.trim(); st.activity = $("sm_act").value.trim(); }
+  const dl = $("sm_delay").value;      // 每步单独间隔(留空=全局)
+  if (dl !== "") st.delay = Number(dl) || 0;
   return st;
 }
 
@@ -533,7 +671,11 @@ $("sm_del").addEventListener("click", () => {
 // ---------- 执行 ----------
 function markCard(idx, cls, text) {
   const card = document.querySelector(`.step-card[data-idx="${idx}"] .step-status`);
-  if (card) { card.textContent = text; card.style.color = cls === "err" ? "#cf222e" : "#1a7f37"; }
+  if (card) {
+    card.textContent = text;
+    const col = cls === "err" ? "#cf222e" : cls === "running" ? "#0969da" : "#1a7f37";
+    card.style.color = col;
+  }
 }
 
 async function runSingleStep(idx) {
@@ -554,7 +696,11 @@ async function runSingleStep(idx) {
       markCard(idx, "err", `✗ ${r.detail}`);
       log(`步骤 ${idx + 1} ✗ ${r.detail}`, "err");
     }
-    refreshScreenshot(state.mode === "widget");   // 执行后刷新；控件模式同步刷新控件树
+    // 编辑/单步交互模式：等界面渲染落定后再刷新，确保截到的是动作后的最新画面
+    if (step.action !== "wait") {
+      await new Promise(res => setTimeout(res, 600));
+    }
+    refreshScreenshot(state.mode === "widget");   // 执行后同步刷新；控件模式同步刷新控件树
   } catch (e) {
     markCard(idx, "err", "✗ " + e.message);
     log(`步骤 ${idx + 1} ✗ ${e.message}`, "err");
@@ -566,41 +712,63 @@ async function runSingleStep(idx) {
 async function runWholeScript() {
   if (state.running || !state.script.steps.length) return;
   state.running = true;
+  state.stopRequested = false;
   state.abortCtl = new AbortController();
   $("btnRun").disabled = true;
   $("btnStop").disabled = false;
   // 清除旧状态标记
-  document.querySelectorAll(".step-card").forEach(c => c.classList.remove("ok", "error"));
+  document.querySelectorAll(".step-card").forEach(c => c.classList.remove("ok", "error", "running"));
   document.querySelectorAll(".step-status").forEach(s => s.textContent = "");
-  log(`▶ 开始运行「${state.script.name}」共 ${state.script.steps.length} 步`, "info");
+  log(`▶ 开始运行「${state.script.name || ""}」共 ${state.script.steps.length} 步`, "info");
+  const globalDelay = Number($("stepDelay").value) || 0;
+  let stopped = false;
   try {
-    const r = await fetch("/api/run_script", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device: currentDevice(), script: state.script }),
-      signal: state.abortCtl.signal,
-    });
-    const data = await r.json();
-    let stopped = false;
-    data.logs.forEach(l => {
-      markCard(l.index, l.ok ? "ok" : "err", l.ok ? `✓ ${l.detail} (${l.ms}ms)` : `✗ ${l.detail}`);
-      log(`步骤 ${l.index + 1} ${l.ok ? "✓" : "✗"} ${l.detail} (${l.ms}ms)${l.note ? " — " + l.note : ""}`,
-          l.ok ? "ok" : "err");
-      if (l.stopped) stopped = true;
-    });
+    // 前端逐条驱动执行，当前步骤框住高亮、滚动到可视区，执行到哪标到哪
+    for (let i = 0; i < state.script.steps.length; i++) {
+      if (state.stopRequested) { stopped = true; break; }
+      const step = state.script.steps[i];
+      const card = document.querySelector(`.step-card[data-idx="${i}"]`);
+      card && card.classList.add("running");
+      card && card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      markCard(i, "running", "执行中...");
+      const r = await api("/api/run_step", {
+        method: "POST",
+        body: JSON.stringify({ device: currentDevice(), step }),
+        signal: state.abortCtl.signal,
+      });
+      card && card.classList.remove("running");
+      if (r.ok) {
+        markCard(i, "ok", `✓ ${r.detail} (${r.ms}ms)`);
+        log(`步骤 ${i + 1} ✓ ${r.detail} (${r.ms}ms)${step.note ? " — " + step.note : ""}`, "ok");
+      } else {
+        markCard(i, "err", `✗ ${r.detail}`);
+        log(`步骤 ${i + 1} ✗ ${r.detail}`, "err");
+        break;
+      }
+      // 每步间隔：局部 delay 优先，否则全局；wait 步骤不再额外间隔
+      if (i < state.script.steps.length - 1 && !state.stopRequested) {
+        let d = 0;
+        if (step.delay != null) d = step.delay;
+        else if (step.action !== "wait") d = globalDelay;
+        if (d > 0) await new Promise(res => setTimeout(res, d));
+      }
+      refreshScreenshot(false);   // 每步后刷新，看到设备当前位于哪
+    }
     log(stopped ? "⏹ 已停止" : "✔ 脚本执行结束", stopped ? "err" : "ok");
-    refreshScreenshot();
+    refreshScreenshot(true);
   } catch (e) {
     if (e.name === "AbortError") log("⏹ 已停止运行", "err");
     else log("运行出错: " + e.message, "err");
   } finally {
     state.running = false;
+    state.stopRequested = false;
     $("btnRun").disabled = false;
     $("btnStop").disabled = true;
   }
 }
 $("btnRun").addEventListener("click", runWholeScript);
 $("btnStop").addEventListener("click", () => {
+  state.stopRequested = true;
   if (state.abortCtl) state.abortCtl.abort();
   state.running = false;
 });
@@ -691,6 +859,15 @@ window.addEventListener("keydown", (e) => {
   // 读取“编辑后自动执行”开关的持久化状态
   try { state.editorAutoRun = localStorage.getItem("autoRunEdit") !== "0"; } catch (_) {}
   $("autoRunEdit").checked = state.editorAutoRun;
+  // 截图已自动裁剪导航栏区域，坐标已对齐 → 强制底校=0（复位之前误设的 78）
+  state.coordYOffset = 0;
+  try { localStorage.setItem("coordYOffset", "0"); } catch (_) {}
+  $("coordY").value = 0;
+  try { state.rtOn = localStorage.getItem("rtOn") === "1"; } catch (_) {}
+  try { state.rtInterval = Math.max(RT_MIN_MS, Number(localStorage.getItem("rtInterval")) || 1000); } catch (_) {}
+  $("rtOn").checked = state.rtOn;
+  $("rtInterval").value = state.rtInterval;
+  syncRt();
   await loadDevices();
   refreshScreenshot(true);
   renderSteps();

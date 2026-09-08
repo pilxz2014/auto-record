@@ -36,6 +36,19 @@ body {
 .btn:hover { background: #eef1f4; }
 .toolbar-toggle { font-size: 13px; display: flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
 .toolbar-toggle input { margin: 0; }
+#btnRecord.recording { background: #cf222e; border-color: #cf222e; color: #fff; }
+
+.rec-bar {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  border-bottom: 1px solid var(--border); background: #fff1f0;
+}
+.rec-dot { color: #cf222e; font-weight: bold; animation: rblink 1s infinite; }
+@keyframes rblink { 50% { opacity: .15; } }
+.rec-count {
+  background: #cf222e; color: #fff; border-radius: 10px;
+  font-size: 12px; padding: 1px 8px; font-weight: 600; flex-shrink: 0;
+}
+.step-card.rec { outline: 2px solid #cf222e; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.success { background: var(--success); border-color: var(--success); color: #fff; }
@@ -162,6 +175,8 @@ input:focus, select:focus { outline: 2px solid #b6d7ff; border-color: var(--prim
 .wgt-row .cls { color: var(--muted); }
 .hint { padding: 6px 12px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); }
 .coord-hint { margin-left: 10px; }
+.coord-calb { margin-left: 12px; display: inline-flex; align-items: center; gap: 4px; color: var(--text); }
+.coord-calb input { width: 54px; }
 .hidden { display: none !important; }
 
 /* ---------- 日志 ---------- */
@@ -207,6 +222,11 @@ input:focus, select:focus { outline: 2px solid #b6d7ff; border-color: var(--prim
   position: absolute; width: 5px; height: 5px; border-radius: 50%;
   background: #ff8c00; transform: translate(-50%, -50%); pointer-events: none;
   box-shadow: 0 0 0 2px rgba(255,255,255,.8);
+}
+.target-mark {
+  position: absolute; width: 26px; height: 26px; border: 2px solid #ff8c00;
+  border-radius: 4px; transform: translate(-50%, -50%); pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(255,140,0,.06);
 }
 .muted { color: var(--muted); font-weight: normal; font-size: 12px; }
 .modal-box pre {
