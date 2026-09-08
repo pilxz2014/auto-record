@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Android 自动化脚本编辑器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header id="toolbar">
+  <div class="brand">🤖 Android 自动化编辑器</div>
+  <div class="device-box">
+    <label>设备:</label>
+    <select id="deviceSelect"><option value="">加载中...</option></select>
+    <span id="adbkbdDot" class="dot off" title="ADBKeyboard 输入法状态(点击安装/启用)">IME</span>
+  </div>
+  <div class="spacer"></div>
+  <label class="toolbar-toggle" title="勾选后：编辑步骤点确定 → 自动在设备上执行该动作 → 刷新截图；取消则只保存不执行">
+    <input id="autoRunEdit" type="checkbox" checked> 编辑后自动执行
+  </label>
+  <button id="btnOpen" class="btn">📂 打开</button>
+  <button id="btnSave" class="btn">💾 保存</button>
+  <button id="btnExport" class="btn primary">📤 导出 .sh</button>
+  <button id="btnRun" class="btn success">▶ 运行整个脚本</button>
+  <button id="btnStop" class="btn danger" disabled>⏹ 停止</button>
+</header>
+
+<main>
+  <!-- 左栏: 脚本属性 + 步骤列表 -->
+  <section id="left">
+    <div class="script-meta">
+      <input id="scriptName" type="text" placeholder="脚本名称" value="未命名脚本">
+      <label title="每个步骤之间等待的毫秒数">间隔(ms) <input id="stepDelay" type="number" value="300" min="0" step="50" style="width:70px"></label>
+      <label title="输入完成后自动发BACK收起软键盘，避免遮挡下一步" style="white-space:nowrap">
+        <input id="hideKbd" type="checkbox" checked>收起键盘
+      </label>
+      <label title="控件(按id/文字定位)没找到时自动重试次数，每次间隔1秒；单步可在编辑窗单独覆盖" style="white-space:nowrap">
+        控件重试 <input id="controlRetry" type="number" value="3" min="0" style="width:46px">
+      </label>
+    </div>
+
+    <div id="stepList"></div>
+
+    <div class="add-step">
+      <div class="add-tip">在选中步骤后插入，或直接添加到列表末尾（动作类型在弹窗里选）</div>
+      <button id="btnAddStep" class="btn">＋ 添加步骤</button>
+    </div>
+  </section>
+
+  <!-- 右栏: 截图面板 -->
+  <section id="right">
+    <div class="panel-tabs">
+      <button class="tab active" data-mode="coord">📍 坐标模式</button>
+      <button class="tab" data-mode="widget">🎯 控件模式</button>
+      <div class="spacer"></div>
+      <button id="btnShot" class="btn small">🔄 刷新截图</button>
+      <button id="btnScrcpy" class="btn small" title="打开 scrcpy 实时镜像">🖥 scrcpy</button>
+    </div>
+
+    <div id="shotWrap">
+      <img id="screenshot" alt="设备截图（点击刷新）" draggable="false">
+      <div id="overlay"></div>
+      <div id="coordTip" class="hidden"></div>
+    </div>
+
+    <div id="widgetPanel" class="hidden">
+      <input id="widgetSearch" type="text" placeholder="搜索 resource-id 或文字...">
+      <div id="widgetList"></div>
+    </div>
+    <div id="coordBar" class="hint">
+      <span id="coordHint">点截图 / 控件 → 弹出步骤编辑窗口，选动作、填名称与内容</span>
+    </div>
+  </section>
+</main>
+
+<footer id="logPanel">
+  <div class="log-head">运行日志 <button id="btnClearLog" class="btn small ghost">清空</button></div>
+  <div id="logBody"></div>
+</footer>
+
+<!-- 步骤编辑弹窗（点击控件/截图、添加、插入、编辑共用） -->
+<div id="stepModal" class="modal hidden">
+  <div class="modal-box step-modal">
+    <div class="modal-title" id="stepModalTitle">添加步骤</div>
+    <div class="form">
+      <label>要执行的动作
+        <select id="sm_action">
+          <option value="tap">👆 点击 (坐标/控件)</option>
+          <option value="tap_clear">🗑 点击并清空</option>
+          <option value="tap_input">⌨️ 点击清空并输入（常见：填账号密码）</option>
+          <option value="tap_id">🎯 点击控件 (resource-id/文字)</option>
+          <option value="input">✍️ 输入文本</option>
+          <option value="clear_text">🧹 清空输入框</option>
+          <option value="key">🎹 按键</option>
+          <option value="swipe">↕️ 滑动</option>
+          <option value="wait">⏱ 等待</option>
+          <option value="start_app">🚀 启动App</option>
+          <option value="back">◀️ 返回</option>
+          <option value="home">🏠 Home</option>
+        </select>
+      </label>
+      <label>名称 / 备注
+        <input id="sm_note" type="text" placeholder="例如：输入账号、点击登录">
+      </label>
+
+      <div id="sm_target" class="form-box">
+        <div class="form-title">点击位置 (三选一)</div>
+        <div class="form-row">
+          <label>X <input id="sm_x" type="number" placeholder="落点 X"></label>
+          <label>Y <input id="sm_y" type="number" placeholder="落点 Y"></label>
+        </div>
+        <label>或 resource-id <input id="sm_rid" type="text" placeholder="com.xx:id/field"></label>
+        <label>或 按文字 <input id="sm_ftext" type="text" placeholder="控件的显示文字"></label>
+        <label class="inrow">没找到重试几次(每次1秒) <input id="sm_retry" type="number" placeholder="留空用全局" style="max-width:120px"></label>
+      </div>
+
+      <label id="sm_inputRow">要输入的内容
+        <textarea id="sm_input" rows="2" placeholder="要输入的账号/密码/文字 (中英文均可)"></textarea>
+      </label>
+
+      <div id="sm_keyRow" class="hidden">
+        <label>按键 <input id="sm_key" type="text" placeholder="TAB" list="keyList">
+          <datalist id="keyList">
+            <option value="TAB"><option value="ENTER"><option value="BACK"><option value="HOME">
+            <option value="DEL"><option value="ESC"><option value="SPACE"><option value="UP">
+            <option value="DOWN"><option value="LEFT"><option value="RIGHT"><option value="MENU">
+          </datalist>
+        </label>
+      </div>
+
+      <div id="sm_swipeRow" class="hidden">
+        <div class="form-box">
+          <div class="form-title">滑动（坐标模式按下截图直接拖动可录制整条轨迹）</div>
+          <div id="sm_swipePath" class="form-note"></div>
+          <div class="form-row">
+            <label>起点X <input id="sm_s1" type="number"></label>
+            <label>起点Y <input id="sm_s2" type="number"></label>
+            <label>终点X <input id="sm_s3" type="number"></label>
+            <label>终点Y <input id="sm_s4" type="number"></label>
+            <label>时长ms <input id="sm_sdur" type="number"></label>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm_waitRow" class="hidden">
+        <label>毫秒 <input id="sm_wms" type="number" placeholder="500"></label>
+      </div>
+
+      <div id="sm_appRow" class="hidden">
+        <label>包名 <input id="sm_pkg" type="text" placeholder="com.android.settings"></label>
+        <label>Activity (可空) <input id="sm_act" type="text" placeholder=".MainActivity"></label>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button id="sm_del" class="btn danger hidden">删除</button>
+      <div class="spacer"></div>
+      <button id="sm_cancel" class="btn">取消</button>
+      <button id="sm_ok" class="btn primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导出结果弹窗 -->
+<div id="exportModal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-title">导出成功 <span id="exportPath" class="muted"></span></div>
+    <pre id="exportContent"></pre>
+    <div class="modal-actions">
+      <button id="btnCopySh" class="btn">复制内容</button>
+      <button id="btnCloseExport" class="btn primary">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

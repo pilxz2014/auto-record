@@ -1,0 +1,18 @@
+# 已保存的脚本 / 导出的 .sh（可能含账号密码等敏感信息）
+scripts/
+exports/
+
+# ADBKeyboard APK 与输入法记录
+adbkeyboard/
+
+# 运行时产物
+__pycache__/
+*.pyc
+*.png
+
+# 个人本地配置
+.claude/settings.local.json
+
+# 系统
+.DS_Store
+Thumbs.db
