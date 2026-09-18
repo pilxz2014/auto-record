@@ -51,7 +51,11 @@ function shQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
-function currentDevice() { return $("deviceSelect").value || state.script.device || ""; }
+function onlineList() { return (state.devices || []).filter(d => d.status === "device"); }
+
+// 当前目标设备：下拉框选中值 > 唯一在线设备。
+// 注意不要回退到脚本里记录的旧序列号——那个设备可能早已离线，会导致截图空白/操作报"设备未连接"
+function currentDevice() { return $("deviceSelect").value || (onlineList()[0] ? onlineList()[0].serial : ""); }
 
 // ---------- 步骤定义 ----------
 const STEP_META = {
@@ -196,6 +200,7 @@ $("btnAddStep").addEventListener("click", () => {
 // ---------- 设备 ----------
 async function loadDevices() {
   try {
+    const prev = $("deviceSelect").value;
     state.devices = await api("/api/devices");
     const sel = $("deviceSelect");
     sel.innerHTML = "";
@@ -209,12 +214,28 @@ async function loadDevices() {
         o.textContent = `${d.model || d.serial} (${d.serial})`;
         sel.appendChild(o);
       });
+      // 保持原有选择；原选择已离线则退回第一台并提示
+      if (prev && online.some(d => d.serial === prev)) {
+        sel.value = prev;
+      } else if (prev) {
+        sel.value = online[0].serial;
+        log(`设备 ${prev} 已离线，已自动切换到 ${online[0].serial}`, "err");
+      }
     }
-    loadImeStatus();
+    // 目标设备发生变化(插入/拔出/切换)才刷新输入法状态与截图，避免定时轮询刷屏
+    const eff = currentDevice();
+    if (eff !== lastEffectiveDev) {
+      lastEffectiveDev = eff;
+      loadImeStatus();
+      refreshScreenshot(false);
+    }
   } catch (e) {
     log("获取设备失败: " + e.message, "err");
   }
 }
+// 定时刷新设备列表：拔掉/换设备时自动跟随，避免一直对着已离线的设备截空图
+let lastEffectiveDev = "";
+setInterval(() => { if (!state.running) loadDevices(); }, 5000);
 $("deviceSelect").addEventListener("change", () => {
   state.script.device = currentDevice();
   loadImeStatus();
@@ -252,17 +273,51 @@ $("adbkbdDot").addEventListener("click", async () => {
 });
 
 // ---------- 截图与坐标 ----------
+let shotTipShown = "";   // 已提示过的截图失败原因，避免实时刷新时刷屏
+
+function showShotTip(msg) {
+  const tip = $("shotTip");
+  if (tip) {
+    tip.innerHTML = msg;
+    tip.classList.remove("hidden");
+  }
+  if (shotTipShown !== msg) {
+    shotTipShown = msg;
+    log(msg.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(), "err");
+  }
+}
+function clearShotTip() {
+  const tip = $("shotTip");
+  if (tip) tip.classList.add("hidden");
+  shotTipShown = "";
+}
+
 function refreshScreenshot(alsoWidgets) {
   const img = $("screenshot");
-  const qs = `?t=${Date.now()}&device=${encodeURIComponent(currentDevice())}`;
+  const dev = currentDevice();
+  if (!dev) {   // 一台设备都没有：直接提示，不要发请求（否则拿到空图片，画面全白看不出原因）
+    state.rtBusy = false;
+    showShotTip("⚠ 无设备连接<br>请用 USB 连接设备并确认 adb devices 能看到它");
+    if (alsoWidgets || state.mode === "widget") loadWidgets();
+    return;
+  }
+  const qs = `?t=${Date.now()}&device=${encodeURIComponent(dev)}`;
   img.src = "/api/screenshot" + qs;
   img.onload = () => {
     state.rtBusy = false;   // 实时刷新可继续下一帧
+    if (!img.naturalWidth) {   // 空图片：后端没拿到画面(设备刚掉线)
+      showShotTip(`⚠ 截图失败：设备 ${dev} 未连接或已断开`);
+      return;
+    }
+    clearShotTip();
     state.shotNatural = { w: img.naturalWidth, h: img.naturalHeight };
     updateScale();
     if (alsoWidgets || state.mode === "widget") loadWidgets();
   };
-  img.onerror = () => { state.rtBusy = false; log("截图失败，请确认设备已连接", "err"); };
+  img.onerror = () => {
+    state.rtBusy = false;
+    showShotTip(`⚠ 截图失败：设备 ${dev} 未连接或已断开<br>请检查 USB 连接与 adb devices`);
+  };
 }
 
 // ---------- 实时刷新 ----------
@@ -681,6 +736,7 @@ function markCard(idx, cls, text) {
 async function runSingleStep(idx) {
   const step = state.script.steps[idx];
   if (!step) return;
+  if (!currentDevice()) { log("没有可用设备：请连接设备后重试（adb devices 确认）", "err"); return; }
   const card = document.querySelector(`.step-card[data-idx="${idx}"]`);
   if (card) card.classList.add("running");
   markCard(idx, "run", "执行中...");
@@ -711,6 +767,11 @@ async function runSingleStep(idx) {
 
 async function runWholeScript() {
   if (state.running || !state.script.steps.length) return;
+  if (!currentDevice()) {
+    log("没有可用设备：请连接设备后重试（adb devices 确认）", "err");
+    refreshScreenshot(false);
+    return;
+  }
   state.running = true;
   state.stopRequested = false;
   state.abortCtl = new AbortController();
@@ -810,7 +871,15 @@ $("btnOpen").addEventListener("click", async () => {
     $("stepDelay").value = data.step_delay_ms ?? 300;
     $("hideKbd").checked = data.hide_keyboard_after_input !== false;
     $("controlRetry").value = data.control_retry ?? 3;
-    if (data.device) $("deviceSelect").value = data.device;
+    // 脚本里记录的设备若已离线，不要写进下拉框（会写入一个不存在的值 → 后续全部报"设备未连接"）
+    if (data.device) {
+      const online = onlineList();
+      if (online.some(d => d.serial === data.device)) {
+        $("deviceSelect").value = data.device;
+      } else if (online.length) {
+        log(`脚本记录的设备 ${data.device} 不在线，已改用 ${online[0].serial}`, "info");
+      }
+    }
     state.selectedIdx = -1;
     renderSteps();
     log(`已打开: ${files[idx].file}`, "ok");

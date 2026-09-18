@@ -16,3 +16,6 @@ __pycache__/
 # 系统
 .DS_Store
 Thumbs.db
+# WorkBuddy 会话数据 / IDE
+.idea/
+.workbuddy/

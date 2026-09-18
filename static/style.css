@@ -142,6 +142,14 @@ input:focus, select:focus { outline: 2px solid #b6d7ff; border-color: var(--prim
   background: #1b1f24; padding: 10px; min-height: 0;
 }
 #screenshot { max-width: 100%; max-height: 100%; user-select: none; cursor: crosshair; }
+/* 无设备 / 截图失败时的占位提示（避免整片空白看不出原因） */
+#shotTip {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  text-align: center; padding: 20px; white-space: pre-line;
+  background: #1b1f24; color: #c9d1d9; font-size: 13px; line-height: 1.7;
+  pointer-events: none; z-index: 2;
+}
+#shotTip.hidden { display: none; }
 #overlay { position: absolute; inset: 0; pointer-events: none; }
 .wgt-box {
   position: absolute; border: 1.5px solid rgba(9, 105, 218, .85);
