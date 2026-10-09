@@ -2,9 +2,6 @@
 scripts/
 exports/
 
-# ADBKeyboard APK 与输入法记录
-adbkeyboard/
-
 # 运行时产物
 __pycache__/
 *.pyc
